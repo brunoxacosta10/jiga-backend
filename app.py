@@ -187,6 +187,124 @@ def play_coinflip():
     })
 
 
+# --- Roleta europeia (0-36, um só zero) ---
+RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+
+def roulette_payout(bet_type, bet_value, number):
+    """Devolve o MULTIPLICADOR de ganho para uma aposta, dado o número que saiu.
+    0 = perdeu. Caso contrário, é quantas vezes a aposta volta (além do reembolso).
+    Ex: cor certa -> 1 (dobra); número exato -> 35."""
+    if number == 0:
+        # só ganha quem apostou exatamente no 0
+        return 35 if (bet_type == "number" and bet_value == 0) else 0
+
+    if bet_type == "number":
+        return 35 if bet_value == number else 0
+    if bet_type == "color":
+        is_red = number in RED_NUMBERS
+        if bet_value == "red":   return 1 if is_red else 0
+        if bet_value == "black": return 1 if not is_red else 0
+        return 0
+    if bet_type == "parity":
+        if bet_value == "even": return 1 if number % 2 == 0 else 0
+        if bet_value == "odd":  return 1 if number % 2 == 1 else 0
+        return 0
+    if bet_type == "half":
+        if bet_value == "low":  return 1 if 1 <= number <= 18 else 0   # 1-18
+        if bet_value == "high": return 1 if 19 <= number <= 36 else 0  # 19-36
+        return 0
+    if bet_type == "dozen":
+        if bet_value == "d1": return 2 if 1 <= number <= 12 else 0
+        if bet_value == "d2": return 2 if 13 <= number <= 24 else 0
+        if bet_value == "d3": return 2 if 25 <= number <= 36 else 0
+        return 0
+    if bet_type == "column":
+        # colunas: 1ª =1,4,7...; 2ª =2,5,8...; 3ª =3,6,9...
+        if bet_value == "c1": return 2 if number % 3 == 1 else 0
+        if bet_value == "c2": return 2 if number % 3 == 2 else 0
+        if bet_value == "c3": return 2 if number % 3 == 0 else 0
+        return 0
+    return 0
+
+
+@app.route("/api/play/roulette", methods=["POST"])
+def play_roulette():
+    """Roleta segura. O número é decidido AQUI no servidor.
+    Corpo: {"bet": 100, "bet_type": "color", "bet_value": "red"}
+      bet_type: number|color|parity|half|dozen|column
+      bet_value: number(0-36) | red/black | even/odd | low/high | d1/d2/d3 | c1/c2/c3
+    Cabeçalho: Authorization: Bearer <token da Supabase>
+    """
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+
+    data = request.get_json(silent=True) or {}
+    try:
+        bet = int(data.get("bet", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "aposta inválida"}), 400
+    bet_type = (data.get("bet_type") or "").lower()
+    bet_value = data.get("bet_value")
+
+    # valida tipo e valor da aposta
+    valid = {
+        "number": None,  # validado em baixo (0-36)
+        "color": {"red","black"},
+        "parity": {"even","odd"},
+        "half": {"low","high"},
+        "dozen": {"d1","d2","d3"},
+        "column": {"c1","c2","c3"},
+    }
+    if bet_type not in valid:
+        return jsonify({"error": "tipo de aposta inválido"}), 400
+    if bet_type == "number":
+        try:
+            bet_value = int(bet_value)
+        except (TypeError, ValueError):
+            return jsonify({"error": "número inválido"}), 400
+        if bet_value < 0 or bet_value > 36:
+            return jsonify({"error": "número tem de ser 0-36"}), 400
+    else:
+        bet_value = (str(bet_value) or "").lower()
+        if bet_value not in valid[bet_type]:
+            return jsonify({"error": "aposta inválida"}), 400
+
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({"error": f"aposta tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if bet > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+
+    # decide o número AQUI, à sorte (0-36)
+    number = secrets.randbelow(37)
+    mult = roulette_payout(bet_type, bet_value, number)
+    won = mult > 0
+    # ganhou: recebe bet*mult (a aposta fica com ele). perdeu: -bet
+    delta = bet * mult if won else -bet
+
+    try:
+        add_user_points(username, delta)
+        new_balance = balance + delta
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+
+    return jsonify({
+        "number": number,
+        "color": ("green" if number == 0 else ("red" if number in RED_NUMBERS else "black")),
+        "won": won,
+        "delta": delta,
+        "balance": new_balance
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8090))
     app.run(host="0.0.0.0", port=port)
