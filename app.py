@@ -32,6 +32,54 @@ SE_JWT = os.environ.get("SE_JWT", "")            # chave secreta — só no Rail
 CHANNEL_ID = os.environ.get("SE_CHANNEL_ID", "") # o teu Channel ID
 SE_BASE = "https://api.streamelements.com/kappa/v2"
 
+# Supabase — para verificar a identidade de quem joga (tokens de login)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://gtvjvaenmtdatbmgcimr.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # publishable key
+
+# Limites das apostas (segurança: evita apostas absurdas)
+MIN_BET = int(os.environ.get("MIN_BET", "1"))
+MAX_BET = int(os.environ.get("MAX_BET", "10000"))
+
+
+def verify_user(req):
+    """Confirma a identidade de quem faz o pedido, via token da Supabase.
+    Devolve o nome de Twitch (login) do utilizador, ou None se inválido."""
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    token = auth[7:]
+    try:
+        url = f"{SUPABASE_URL}/auth/v1/user"
+        headers = {"Authorization": f"Bearer {token}", "apikey": SUPABASE_KEY}
+        r = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        meta = data.get("user_metadata") or {}
+        # o login da Twitch vem em nickname / preferred_username / name
+        login = (meta.get("nickname") or meta.get("preferred_username")
+                 or meta.get("user_name") or meta.get("name") or "")
+        return login.lower() if login else None
+    except Exception:
+        return None
+
+
+def get_user_points(username):
+    """Lê os pontos atuais de um utilizador no StreamElements."""
+    try:
+        data = se_request(f"/points/{CHANNEL_ID}/{username}")
+        return int(data.get("points", 0))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return 0
+        raise
+
+
+def add_user_points(username, delta):
+    """Adiciona (ou tira, se delta negativo) pontos a um utilizador.
+    Usa o endpoint do StreamElements que soma ao saldo existente."""
+    # endpoint: PUT /points/:channel/:user/:amount  (amount pode ser negativo)
+    se_request(f"/points/{CHANNEL_ID}/{username}/{delta}", method="PUT")
+
 
 def se_request(path, method="GET", body=None):
     """Faz um pedido à API do StreamElements com o JWT secreto."""
@@ -79,6 +127,64 @@ def get_points(username):
         return jsonify({"error": f"streamelements erro {e.code}"}), 502
     except Exception as e:
         return jsonify({"error": "falha a contactar o streamelements"}), 502
+
+
+import secrets
+
+@app.route("/api/play/coinflip", methods=["POST"])
+def play_coinflip():
+    """Coinflip seguro. O resultado é decidido AQUI no servidor, não no site.
+    Corpo: {"bet": 100, "choice": "heads"|"tails"}
+    Cabeçalho: Authorization: Bearer <token da Supabase>
+    """
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+
+    # 1) confirma QUEM está a jogar (identidade via Supabase) — segurança
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+
+    # 2) valida a aposta
+    data = request.get_json(silent=True) or {}
+    try:
+        bet = int(data.get("bet", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "aposta inválida"}), 400
+    choice = (data.get("choice") or "").lower()
+    if choice not in ("heads", "tails"):
+        return jsonify({"error": "escolhe cara (heads) ou coroa (tails)"}), 400
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({"error": f"aposta tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+
+    # 3) confirma que a pessoa TEM mesmo os pontos (lê o saldo real)
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if bet > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+
+    # 4) decide o resultado AQUI, à sorte, de forma justa (secrets = aleatório seguro)
+    result = secrets.choice(["heads", "tails"])
+    won = (result == choice)
+
+    # 5) aplica o resultado nos pontos reais
+    #    ganhou: +bet (ficou com o dobro da aposta no total)
+    #    perdeu: -bet
+    delta = bet if won else -bet
+    try:
+        add_user_points(username, delta)
+        new_balance = balance + delta
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+
+    return jsonify({
+        "result": result,      # heads / tails que saiu
+        "won": won,
+        "delta": delta,        # quanto ganhou (+) ou perdeu (-)
+        "balance": new_balance # saldo novo
+    })
 
 
 if __name__ == "__main__":

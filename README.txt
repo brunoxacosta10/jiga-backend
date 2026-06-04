@@ -12,6 +12,10 @@ PÔR NO RAILWAY:
    - SE_JWT          = (o teu JWT token do StreamElements — SECRETO)
    - SE_CHANNEL_ID   = 5fffb03b13002b8e2bd5a5ab
    - ALLOWED_ORIGINS = https://jigadores.com,https://www.jigadores.com
+   - SUPABASE_URL    = https://gtvjvaenmtdatbmgcimr.supabase.co
+   - SUPABASE_KEY    = sb_publishable_RzjL7nd7qU4ZsOA-FhM-pQ_LkKmc14N
+   - MIN_BET         = 1      (opcional)
+   - MAX_BET         = 10000  (opcional)
 4. O Railway arranca com o Procfile (gunicorn).
 5. Gera um domínio (Settings -> Networking -> Generate Domain).
 
