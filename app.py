@@ -305,6 +305,99 @@ def play_roulette():
     })
 
 
+@app.route("/api/play/roulette_multi", methods=["POST"])
+def play_roulette_multi():
+    """Roleta com várias apostas de uma vez (mesa realista).
+    Corpo: {"bets": [{"bet_type":"color","bet_value":"red","bet":100}, ...]}
+    Um único número é sorteado e aplicado a todas as apostas.
+    """
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+
+    data = request.get_json(silent=True) or {}
+    bet_list = data.get("bets")
+    if not isinstance(bet_list, list) or not bet_list:
+        return jsonify({"error": "sem apostas"}), 400
+    if len(bet_list) > 50:
+        return jsonify({"error": "demasiadas apostas"}), 400
+
+    valid = {
+        "number": None,
+        "color": {"red", "black"},
+        "parity": {"even", "odd"},
+        "half": {"low", "high"},
+        "dozen": {"d1", "d2", "d3"},
+        "column": {"c1", "c2", "c3"},
+    }
+
+    # valida cada aposta e soma o total
+    clean = []
+    total = 0
+    for b in bet_list:
+        try:
+            amt = int(b.get("bet", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "aposta inválida"}), 400
+        bt = (b.get("bet_type") or "").lower()
+        bv = b.get("bet_value")
+        if bt not in valid:
+            return jsonify({"error": "tipo de aposta inválido"}), 400
+        if bt == "number":
+            try:
+                bv = int(bv)
+            except (TypeError, ValueError):
+                return jsonify({"error": "número inválido"}), 400
+            if bv < 0 or bv > 36:
+                return jsonify({"error": "número 0-36"}), 400
+        else:
+            bv = str(bv).lower()
+            if bv not in valid[bt]:
+                return jsonify({"error": "aposta inválida"}), 400
+        if amt < 1:
+            return jsonify({"error": "aposta tem de ser positiva"}), 400
+        clean.append((bt, bv, amt))
+        total += amt
+
+    if total < MIN_BET or total > MAX_BET:
+        return jsonify({"error": f"aposta total tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+
+    # confirma saldo
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if total > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+
+    # sorteia UM número e aplica a todas as apostas
+    number = secrets.randbelow(37)
+    gross_return = 0   # quanto volta ao jogador (ganhos + reembolso das que ganharam)
+    for bt, bv, amt in clean:
+        mult = roulette_payout(bt, bv, number)
+        if mult > 0:
+            gross_return += amt + amt * mult  # devolve aposta + ganho
+
+    # delta = o que volta menos tudo o que apostou
+    delta = gross_return - total
+    try:
+        if delta != 0:
+            add_user_points(username, delta)
+        new_balance = balance + delta
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+
+    return jsonify({
+        "number": number,
+        "color": ("green" if number == 0 else ("red" if number in RED_NUMBERS else "black")),
+        "delta": delta,
+        "balance": new_balance
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8090))
     app.run(host="0.0.0.0", port=port)
