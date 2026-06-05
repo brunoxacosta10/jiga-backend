@@ -398,6 +398,360 @@ def play_roulette_multi():
     })
 
 
+# ====================== BLACKJACK ======================
+# Estado dos jogos ativos em memória. chave = game_id -> estado.
+# (em produção a sério usaria-se Redis/DB; para este volume, memória chega)
+import time
+import uuid
+BJ_GAMES = {}
+BJ_TTL = 1800  # 30 min: jogos abandonados são limpos
+
+def _bj_cleanup():
+    now = time.time()
+    for gid in list(BJ_GAMES.keys()):
+        if now - BJ_GAMES[gid].get("ts", now) > BJ_TTL:
+            BJ_GAMES.pop(gid, None)
+
+def _new_deck():
+    # 6 baralhos (como num casino), baralhados com aleatório seguro
+    deck = []
+    for _ in range(6):
+        for r in ["A","2","3","4","5","6","7","8","9","10","J","Q","K"]:
+            for s in ["♠","♥","♦","♣"]:
+                deck.append({"r": r, "s": s})
+    # shuffle Fisher-Yates com secrets
+    for i in range(len(deck)-1, 0, -1):
+        j = secrets.randbelow(i+1)
+        deck[i], deck[j] = deck[j], deck[i]
+    return deck
+
+def _draw(state):
+    return state["deck"].pop()
+
+def hand_value(cards):
+    """Valor da mão. Ás = 11 ou 1 (o melhor possível). Devolve (valor, é_soft)."""
+    total = 0
+    aces = 0
+    for c in cards:
+        r = c["r"]
+        if r == "A":
+            total += 11; aces += 1
+        elif r in ("K","Q","J","10"):
+            total += 10
+        else:
+            total += int(r)
+    soft = False
+    while total > 21 and aces > 0:
+        total -= 10; aces -= 1
+    if aces > 0 and total <= 21:
+        soft = True
+    return total, soft
+
+def is_blackjack(cards):
+    return len(cards) == 2 and hand_value(cards)[0] == 21
+
+def _public_state(state, reveal_dealer=False):
+    """O que o site pode ver. As cartas do dealer ficam escondidas até ao fim."""
+    hands = []
+    for h in state["hands"]:
+        v, soft = hand_value(h["cards"])
+        hands.append({
+            "cards": h["cards"], "value": v, "soft": soft,
+            "bet": h["bet"], "done": h["done"], "result": h.get("result"),
+            "is_bj": is_blackjack(h["cards"]) and len(state["hands"]) == 1,
+        })
+    if reveal_dealer:
+        dv, _ = hand_value(state["dealer"])
+        dealer = {"cards": state["dealer"], "value": dv}
+    else:
+        # mostra só a primeira carta do dealer
+        dealer = {"cards": [state["dealer"][0], {"r":"?","s":"?"}], "value": None}
+    return {
+        "game_id": state["game_id"],
+        "hands": hands,
+        "active_hand": state["active"],
+        "dealer": dealer,
+        "status": state["status"],          # playing | done
+        "can_double": state.get("can_double", False),
+        "can_split": state.get("can_split", False),
+        "can_insurance": state.get("can_insurance", False),
+        "balance": state.get("balance"),
+        "total_delta": state.get("total_delta"),
+    }
+
+def _settle(state):
+    """Joga o dealer e calcula resultados de todas as mãos. Mexe nos pontos uma vez."""
+    username = state["username"]
+    # o dealer revela e pede até 17 (pára em 17, inclusive soft 17 fica — regra S17)
+    dv, dsoft = hand_value(state["dealer"])
+    # se ainda há mãos não rebentadas, o dealer joga
+    any_alive = any(hand_value(h["cards"])[0] <= 21 for h in state["hands"])
+    if any_alive:
+        while True:
+            dv, dsoft = hand_value(state["dealer"])
+            if dv < 17:
+                state["dealer"].append(_draw(state))
+            else:
+                break
+    dv, _ = hand_value(state["dealer"])
+    dealer_bj = is_blackjack(state["dealer"])
+
+    total_return = 0  # quanto volta ao jogador (já tirámos as apostas no início)
+    for h in state["hands"]:
+        pv = hand_value(h["cards"])[0]
+        bet = h["bet"]
+        player_bj = is_blackjack(h["cards"]) and len(state["hands"]) == 1
+        if pv > 21:
+            h["result"] = "bust"          # perdeu (aposta já foi)
+        elif player_bj and not dealer_bj:
+            h["result"] = "blackjack"      # paga 3:2 -> devolve aposta + 1.5x
+            total_return += bet + int(bet * 1.5)
+        elif dealer_bj and not player_bj:
+            h["result"] = "lose"
+        elif dv > 21:
+            h["result"] = "win"            # dealer rebentou
+            total_return += bet * 2
+        elif pv > dv:
+            h["result"] = "win"
+            total_return += bet * 2
+        elif pv < dv:
+            h["result"] = "lose"
+        else:
+            h["result"] = "push"           # empate: devolve a aposta
+            total_return += bet
+    # seguro (insurance): se o jogador pagou seguro e o dealer tem BJ, paga 2:1
+    ins = state.get("insurance", 0)
+    if ins > 0 and dealer_bj:
+        total_return += ins * 3  # devolve o seguro + 2x
+
+    # aplica nos pontos reais: já tínhamos tirado (apostas+seguro) no início.
+    # agora devolvemos o que o jogador recupera.
+    if total_return > 0:
+        try:
+            add_user_points(username, total_return)
+        except Exception:
+            pass
+    # delta total desta partida = devolvido - tudo o que foi apostado
+    staked = sum(h["bet"] for h in state["hands"]) + ins
+    state["total_delta"] = total_return - staked
+    state["status"] = "done"
+    try:
+        state["balance"] = get_user_points(username)
+    except Exception:
+        state["balance"] = None
+
+
+@app.route("/api/play/blackjack/start", methods=["POST"])
+def bj_start():
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    _bj_cleanup()
+    data = request.get_json(silent=True) or {}
+    try:
+        bet = int(data.get("bet", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "aposta inválida"}), 400
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({"error": f"aposta tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if bet > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+
+    # tira a aposta já (devolve-se no fim conforme o resultado)
+    try:
+        add_user_points(username, -bet)
+    except Exception:
+        return jsonify({"error": "falha a aplicar a aposta"}), 502
+
+    deck = _new_deck()
+    state = {
+        "game_id": uuid.uuid4().hex,
+        "username": username,
+        "deck": deck,
+        "hands": [{"cards": [], "bet": bet, "done": False, "result": None}],
+        "dealer": [],
+        "active": 0,
+        "status": "playing",
+        "insurance": 0,
+        "ts": time.time(),
+    }
+    # reparte: jogador, dealer, jogador, dealer
+    state["hands"][0]["cards"].append(_draw(state))
+    state["dealer"].append(_draw(state))
+    state["hands"][0]["cards"].append(_draw(state))
+    state["dealer"].append(_draw(state))
+
+    # opções disponíveis
+    pc = state["hands"][0]["cards"]
+    state["can_double"] = (balance - bet) >= bet
+    state["can_split"] = (pc[0]["r"] == pc[1]["r"] or
+                          (pc[0]["r"] in ("10","J","Q","K") and pc[1]["r"] in ("10","J","Q","K"))) and (balance - bet) >= bet
+    state["can_insurance"] = state["dealer"][0]["r"] == "A" and (balance - bet) >= bet // 2
+
+    # blackjack imediato? resolve já
+    if is_blackjack(pc):
+        _settle(state)
+        BJ_GAMES[state["game_id"]] = state
+        return jsonify(_public_state(state, reveal_dealer=True))
+
+    BJ_GAMES[state["game_id"]] = state
+    return jsonify(_public_state(state))
+
+
+def _get_game(req):
+    data = req.get_json(silent=True) or {}
+    gid = data.get("game_id")
+    state = BJ_GAMES.get(gid)
+    return state, data
+
+def _verify_owner(req, state):
+    """Confirma que quem age é o dono do jogo."""
+    username = verify_user(req)
+    if not username or not state or state["username"] != username:
+        return False
+    return True
+
+
+@app.route("/api/play/blackjack/hit", methods=["POST"])
+def bj_hit():
+    state, _ = _get_game(request)
+    if not _verify_owner(request, state):
+        return jsonify({"error": "jogo inválido"}), 400
+    if state["status"] != "playing":
+        return jsonify({"error": "jogo terminado"}), 400
+    h = state["hands"][state["active"]]
+    h["cards"].append(_draw(state))
+    state["can_double"] = False
+    state["can_split"] = False
+    state["can_insurance"] = False
+    state["ts"] = time.time()
+    v = hand_value(h["cards"])[0]
+    if v >= 21:
+        h["done"] = True
+        return _bj_advance(state)
+    return jsonify(_public_state(state))
+
+
+@app.route("/api/play/blackjack/stand", methods=["POST"])
+def bj_stand():
+    state, _ = _get_game(request)
+    if not _verify_owner(request, state):
+        return jsonify({"error": "jogo inválido"}), 400
+    if state["status"] != "playing":
+        return jsonify({"error": "jogo terminado"}), 400
+    state["hands"][state["active"]]["done"] = True
+    state["ts"] = time.time()
+    return _bj_advance(state)
+
+
+@app.route("/api/play/blackjack/double", methods=["POST"])
+def bj_double():
+    state, _ = _get_game(request)
+    if not _verify_owner(request, state):
+        return jsonify({"error": "jogo inválido"}), 400
+    if state["status"] != "playing":
+        return jsonify({"error": "jogo terminado"}), 400
+    h = state["hands"][state["active"]]
+    if len(h["cards"]) != 2:
+        return jsonify({"error": "só podes dobrar no início da mão"}), 400
+    username = state["username"]
+    bet = h["bet"]
+    try:
+        bal = get_user_points(username)
+        if bal < bet:
+            return jsonify({"error": "não tens pontos para dobrar"}), 400
+        add_user_points(username, -bet)  # tira a aposta extra
+    except Exception:
+        return jsonify({"error": "falha a dobrar"}), 502
+    h["bet"] += bet
+    h["cards"].append(_draw(state))   # só mais uma carta
+    h["done"] = True
+    state["ts"] = time.time()
+    return _bj_advance(state)
+
+
+@app.route("/api/play/blackjack/split", methods=["POST"])
+def bj_split():
+    state, _ = _get_game(request)
+    if not _verify_owner(request, state):
+        return jsonify({"error": "jogo inválido"}), 400
+    if state["status"] != "playing":
+        return jsonify({"error": "jogo terminado"}), 400
+    if len(state["hands"]) != 1:
+        return jsonify({"error": "só podes dividir uma vez"}), 400
+    h = state["hands"][0]
+    if len(h["cards"]) != 2:
+        return jsonify({"error": "só podes dividir no início"}), 400
+    c0, c1 = h["cards"]
+    same = c0["r"] == c1["r"] or (c0["r"] in ("10","J","Q","K") and c1["r"] in ("10","J","Q","K"))
+    if not same:
+        return jsonify({"error": "só podes dividir cartas iguais"}), 400
+    username = state["username"]
+    bet = h["bet"]
+    try:
+        bal = get_user_points(username)
+        if bal < bet:
+            return jsonify({"error": "não tens pontos para dividir"}), 400
+        add_user_points(username, -bet)  # segunda mão precisa de outra aposta
+    except Exception:
+        return jsonify({"error": "falha a dividir"}), 502
+    # cria duas mãos
+    state["hands"] = [
+        {"cards": [c0, _draw(state)], "bet": bet, "done": False, "result": None},
+        {"cards": [c1, _draw(state)], "bet": bet, "done": False, "result": None},
+    ]
+    state["active"] = 0
+    state["can_double"] = True
+    state["can_split"] = False
+    state["can_insurance"] = False
+    state["ts"] = time.time()
+    return jsonify(_public_state(state))
+
+
+@app.route("/api/play/blackjack/insurance", methods=["POST"])
+def bj_insurance():
+    state, _ = _get_game(request)
+    if not _verify_owner(request, state):
+        return jsonify({"error": "jogo inválido"}), 400
+    if state["status"] != "playing" or not state.get("can_insurance"):
+        return jsonify({"error": "seguro indisponível"}), 400
+    username = state["username"]
+    ins = state["hands"][0]["bet"] // 2
+    try:
+        bal = get_user_points(username)
+        if bal < ins:
+            return jsonify({"error": "sem pontos para seguro"}), 400
+        add_user_points(username, -ins)
+    except Exception:
+        return jsonify({"error": "falha no seguro"}), 502
+    state["insurance"] = ins
+    state["can_insurance"] = False
+    state["ts"] = time.time()
+    return jsonify(_public_state(state))
+
+
+def _bj_advance(state):
+    """Passa à mão seguinte; se não há mais, joga o dealer e resolve."""
+    # procura a próxima mão não terminada
+    n = len(state["hands"])
+    nxt = state["active"]
+    while nxt < n and state["hands"][nxt]["done"]:
+        nxt += 1
+    if nxt < n:
+        state["active"] = nxt
+        state["can_double"] = len(state["hands"][nxt]["cards"]) == 2
+        return jsonify(_public_state(state))
+    # todas as mãos terminadas -> dealer joga e resolve
+    _settle(state)
+    return jsonify(_public_state(state, reveal_dealer=True))
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8090))
     app.run(host="0.0.0.0", port=port)
