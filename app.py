@@ -40,6 +40,24 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # publishable key
 MIN_BET = int(os.environ.get("MIN_BET", "1"))
 MAX_BET = int(os.environ.get("MAX_BET", "10000"))
 
+# Contas a ESCONDER do ranking: bots e contas de sistema (sempre minúsculas).
+# Podes acrescentar mais pelo Railway com a variável LEADERBOARD_HIDE
+# (nomes separados por vírgula), além desta lista por defeito.
+_HIDE_DEFAULT = {
+    # a própria conta do canal e o bot do StreamElements
+    "jigadores", "streamelements", "streamlabs",
+    # bots de chat comuns
+    "nightbot", "moobot", "fossabot", "wizebot", "botisimo", "coebot",
+    "phantombot", "deepbot", "ankhbot", "vivbot", "soundalerts", "pretzelrocks",
+    "sery_bot", "kofistreambot", "tangiabot", "blerp", "lumiastream", "streamstickers",
+    # "viewers" automáticos / lurkers conhecidos
+    "commanderroot", "anotherttvviewer", "stay_hydrated_bot", "streamfahrer",
+}
+_HIDE_EXTRA = {
+    u.strip().lower() for u in os.environ.get("LEADERBOARD_HIDE", "").split(",") if u.strip()
+}
+LEADERBOARD_HIDE = _HIDE_DEFAULT | _HIDE_EXTRA
+
 
 def verify_user(req):
     """Confirma a identidade de quem faz o pedido, via token da Supabase.
@@ -144,13 +162,20 @@ def leaderboard():
     except (TypeError, ValueError):
         limit = 10
     limit = max(1, min(limit, 50))
+    # buscamos MAIS ao StreamElements do que vamos mostrar, porque vamos
+    # remover bots e contas de sistema — assim o top continua cheio de jogadores reais
+    fetch_n = min(limit + len(LEADERBOARD_HIDE) + 30, 200)
     try:
-        data = se_request(f"/points/{CHANNEL_ID}/top?limit={limit}&offset=0")
+        data = se_request(f"/points/{CHANNEL_ID}/top?limit={fetch_n}&offset=0")
         users = data.get("users", []) if isinstance(data, dict) else []
-        board = [
-            {"name": u.get("username", "?"), "score": int(u.get("points", 0))}
-            for u in users
-        ]
+        board = []
+        for u in users:
+            name = (u.get("username", "") or "").strip()
+            if not name or name.lower() in LEADERBOARD_HIDE:
+                continue  # esconde bots / contas de sistema
+            board.append({"name": name, "score": int(u.get("points", 0))})
+            if len(board) >= limit:
+                break
         return jsonify(board)
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"streamelements erro {e.code}"}), 502
