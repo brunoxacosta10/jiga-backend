@@ -129,6 +129,35 @@ def get_points(username):
         return jsonify({"error": "falha a contactar o streamelements"}), 502
 
 
+@app.route("/api/leaderboard")
+def leaderboard():
+    """Top jogadores por pontos do canal (vem do leaderboard do StreamElements).
+    Devolve uma lista [{name, score}] que o site usa para o pódio.
+    O parâmetro ?period é aceite mas ignorado — o StreamElements devolve o
+    leaderboard actual do canal (que o streamer pode configurar para resetar
+    semanal/mensal nas definições de Loyalty)."""
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+    # quantos lugares mostrar (o site usa top 3 no pódio + lista até 10)
+    try:
+        limit = int(request.args.get("limit", 10))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 50))
+    try:
+        data = se_request(f"/points/{CHANNEL_ID}/top?limit={limit}&offset=0")
+        users = data.get("users", []) if isinstance(data, dict) else []
+        board = [
+            {"name": u.get("username", "?"), "score": int(u.get("points", 0))}
+            for u in users
+        ]
+        return jsonify(board)
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"streamelements erro {e.code}"}), 502
+    except Exception:
+        return jsonify({"error": "falha a contactar o streamelements"}), 502
+
+
 import secrets
 
 @app.route("/api/play/coinflip", methods=["POST"])
