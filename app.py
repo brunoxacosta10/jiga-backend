@@ -892,6 +892,75 @@ def _bj_advance(state):
     return jsonify(_public_state(state, reveal_dealer=True))
 
 
+# ====== TWITCH: estado AO VIVO (auto) ======
+import urllib.parse as _uparse
+
+TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
+TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
+TWITCH_CHANNEL = os.environ.get("TWITCH_CHANNEL", "jigadores").strip().lower()
+
+_twitch_token = {"value": "", "exp": 0}   # cache do App Access Token
+_live_cache = {"data": None, "exp": 0}    # cache curto do estado (~30s)
+
+
+def _twitch_app_token():
+    """Obtem (e cacheia) um App Access Token da Twitch (client_credentials)."""
+    now = time.time()
+    if _twitch_token["value"] and _twitch_token["exp"] > now + 30:
+        return _twitch_token["value"]
+    body = _uparse.urlencode({
+        "client_id": TWITCH_CLIENT_ID,
+        "client_secret": TWITCH_CLIENT_SECRET,
+        "grant_type": "client_credentials",
+    }).encode()
+    req = urllib.request.Request("https://id.twitch.tv/oauth2/token",
+                                 data=body, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode())
+    _twitch_token["value"] = data["access_token"]
+    _twitch_token["exp"] = now + int(data.get("expires_in", 3600))
+    return _twitch_token["value"]
+
+
+@app.route("/api/live")
+def api_live():
+    """Diz se o canal esta em direto na Twitch (cacheado ~30s).
+    Sem TWITCH_CLIENT_ID/SECRET -> configured=False (o frontend trata isso)."""
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        return jsonify({"live": False, "configured": False})
+    now = time.time()
+    if _live_cache["data"] is not None and _live_cache["exp"] > now:
+        return jsonify(_live_cache["data"])
+    try:
+        token = _twitch_app_token()
+        url = ("https://api.twitch.tv/helix/streams?user_login="
+               + _uparse.quote(TWITCH_CHANNEL))
+        headers = {"Client-Id": TWITCH_CLIENT_ID,
+                   "Authorization": f"Bearer {token}"}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        items = data.get("data") or []
+        if items:
+            s = items[0]
+            out = {
+                "live": True, "configured": True,
+                "title": s.get("title", ""),
+                "game": s.get("game_name", ""),
+                "viewers": s.get("viewer_count", 0),
+                "started_at": s.get("started_at", ""),
+                "channel": TWITCH_CHANNEL,
+            }
+        else:
+            out = {"live": False, "configured": True, "channel": TWITCH_CHANNEL}
+    except Exception:
+        out = {"live": False, "configured": True, "error": True,
+               "channel": TWITCH_CHANNEL}
+    _live_cache["data"] = out
+    _live_cache["exp"] = now + 30
+    return jsonify(out)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8090))
     app.run(host="0.0.0.0", port=port)
