@@ -399,18 +399,79 @@ def play_roulette_multi():
 
 
 # ====================== BLACKJACK ======================
-# Estado dos jogos ativos em memória. chave = game_id -> estado.
-# (em produção a sério usaria-se Redis/DB; para este volume, memória chega)
+# Estado dos jogos ativos, PERSISTIDO EM DISCO.
+#
+# Porquê disco e não só memória: o Railway reinicia o backend de vez em quando
+# (deploys, sleep, crashes). Se o estado vivesse só em memória (dict), todos os
+# jogos a meio desapareciam no restart -> o jogador carregava "Pedir carta" e
+# levava "jogo inválido" porque o jogo já não existia. Guardando em disco,
+# os jogos sobrevivem a restarts.
 import time
 import uuid
-BJ_GAMES = {}
+import json as _json
+import threading
+
+# ficheiro onde os jogos vivem (no Railway, /tmp é escrita garantida)
+BJ_STORE_PATH = os.environ.get("BJ_STORE_PATH", "/tmp/bj_games.json")
 BJ_TTL = 1800  # 30 min: jogos abandonados são limpos
+_bj_lock = threading.Lock()  # evita corridas quando 2 pedidos chegam juntos
+
+
+def _bj_load():
+    """Lê todos os jogos do disco. Devolve dict {game_id: state}."""
+    try:
+        with open(BJ_STORE_PATH, "r") as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _bj_save(games):
+    """Grava todos os jogos no disco (escrita atómica para não corromper)."""
+    tmp = BJ_STORE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            _json.dump(games, f)
+        os.replace(tmp, BJ_STORE_PATH)  # troca atómica
+    except Exception as e:
+        print(f"[bj] erro a gravar jogos: {e}")
+
+
+def _bj_get(game_id):
+    """Lê um jogo específico do disco."""
+    if not game_id:
+        return None
+    return _bj_load().get(game_id)
+
+
+def _bj_put(state):
+    """Grava/actualiza um jogo no disco (com lock para segurança)."""
+    with _bj_lock:
+        games = _bj_load()
+        games[state["game_id"]] = state
+        _bj_save(games)
+
+
+def _bj_delete(game_id):
+    """Remove um jogo do disco."""
+    with _bj_lock:
+        games = _bj_load()
+        games.pop(game_id, None)
+        _bj_save(games)
+
 
 def _bj_cleanup():
-    now = time.time()
-    for gid in list(BJ_GAMES.keys()):
-        if now - BJ_GAMES[gid].get("ts", now) > BJ_TTL:
-            BJ_GAMES.pop(gid, None)
+    """Limpa jogos abandonados (mais de 30 min sem actividade)."""
+    with _bj_lock:
+        games = _bj_load()
+        now = time.time()
+        changed = False
+        for gid in list(games.keys()):
+            if now - games[gid].get("ts", now) > BJ_TTL:
+                games.pop(gid, None)
+                changed = True
+        if changed:
+            _bj_save(games)
 
 def _new_deck():
     # 6 baralhos (como num casino), baralhados com aleatório seguro
@@ -597,32 +658,46 @@ def bj_start():
     # blackjack imediato? resolve já
     if is_blackjack(pc):
         _settle(state)
-        BJ_GAMES[state["game_id"]] = state
+        state["status"] = "done"
+        # jogo já acabou (blackjack natural) — nem vale a pena guardar, mas
+        # guardamos por consistência e o cleanup trata depois
         return jsonify(_public_state(state, reveal_dealer=True))
 
-    BJ_GAMES[state["game_id"]] = state
+    _bj_put(state)  # grava o jogo novo no disco
     return jsonify(_public_state(state))
 
 
 def _get_game(req):
     data = req.get_json(silent=True) or {}
     gid = data.get("game_id")
-    state = BJ_GAMES.get(gid)
+    state = _bj_get(gid)
     return state, data
 
 def _verify_owner(req, state):
-    """Confirma que quem age é o dono do jogo."""
+    """Confirma que quem age é o dono do jogo.
+    Devolve (ok, mensagem_de_erro). Mensagens distintas para diagnóstico:
+    - 'não autenticado': o token da Supabase falhou
+    - 'jogo não encontrado': o game_id não existe (expirou ou perdeu-se)
+    - 'este jogo não é teu': o jogo existe mas é de outro utilizador
+    """
     username = verify_user(req)
-    if not username or not state or state["username"] != username:
-        return False
-    return True
+    if not username:
+        return False, "não autenticado"
+    if not state:
+        return False, "jogo não encontrado"
+    # comparação à prova de maiúsculas/espaços
+    owner = (state.get("username") or "").strip().lower()
+    if owner != username.strip().lower():
+        return False, "este jogo não é teu"
+    return True, None
 
 
 @app.route("/api/play/blackjack/hit", methods=["POST"])
 def bj_hit():
     state, _ = _get_game(request)
-    if not _verify_owner(request, state):
-        return jsonify({"error": "jogo inválido"}), 400
+    ok, err = _verify_owner(request, state)
+    if not ok:
+        return jsonify({"error": err}), 400
     if state["status"] != "playing":
         return jsonify({"error": "jogo terminado"}), 400
     h = state["hands"][state["active"]]
@@ -635,14 +710,16 @@ def bj_hit():
     if v >= 21:
         h["done"] = True
         return _bj_advance(state)
+    _bj_put(state)  # grava o estado actualizado
     return jsonify(_public_state(state))
 
 
 @app.route("/api/play/blackjack/stand", methods=["POST"])
 def bj_stand():
     state, _ = _get_game(request)
-    if not _verify_owner(request, state):
-        return jsonify({"error": "jogo inválido"}), 400
+    ok, err = _verify_owner(request, state)
+    if not ok:
+        return jsonify({"error": err}), 400
     if state["status"] != "playing":
         return jsonify({"error": "jogo terminado"}), 400
     state["hands"][state["active"]]["done"] = True
@@ -653,8 +730,9 @@ def bj_stand():
 @app.route("/api/play/blackjack/double", methods=["POST"])
 def bj_double():
     state, _ = _get_game(request)
-    if not _verify_owner(request, state):
-        return jsonify({"error": "jogo inválido"}), 400
+    ok, err = _verify_owner(request, state)
+    if not ok:
+        return jsonify({"error": err}), 400
     if state["status"] != "playing":
         return jsonify({"error": "jogo terminado"}), 400
     h = state["hands"][state["active"]]
@@ -679,8 +757,9 @@ def bj_double():
 @app.route("/api/play/blackjack/split", methods=["POST"])
 def bj_split():
     state, _ = _get_game(request)
-    if not _verify_owner(request, state):
-        return jsonify({"error": "jogo inválido"}), 400
+    ok, err = _verify_owner(request, state)
+    if not ok:
+        return jsonify({"error": err}), 400
     if state["status"] != "playing":
         return jsonify({"error": "jogo terminado"}), 400
     if len(state["hands"]) != 1:
@@ -711,14 +790,16 @@ def bj_split():
     state["can_split"] = False
     state["can_insurance"] = False
     state["ts"] = time.time()
+    _bj_put(state)  # grava o estado actualizado
     return jsonify(_public_state(state))
 
 
 @app.route("/api/play/blackjack/insurance", methods=["POST"])
 def bj_insurance():
     state, _ = _get_game(request)
-    if not _verify_owner(request, state):
-        return jsonify({"error": "jogo inválido"}), 400
+    ok, err = _verify_owner(request, state)
+    if not ok:
+        return jsonify({"error": err}), 400
     if state["status"] != "playing" or not state.get("can_insurance"):
         return jsonify({"error": "seguro indisponível"}), 400
     username = state["username"]
@@ -733,6 +814,7 @@ def bj_insurance():
     state["insurance"] = ins
     state["can_insurance"] = False
     state["ts"] = time.time()
+    _bj_put(state)  # grava o estado actualizado
     return jsonify(_public_state(state))
 
 
@@ -746,9 +828,13 @@ def _bj_advance(state):
     if nxt < n:
         state["active"] = nxt
         state["can_double"] = len(state["hands"][nxt]["cards"]) == 2
+        _bj_put(state)  # grava o estado actualizado no disco
         return jsonify(_public_state(state))
     # todas as mãos terminadas -> dealer joga e resolve
     _settle(state)
+    # jogo acabou: grava resultado final e depois remove (já não é preciso)
+    state["status"] = "done"
+    _bj_delete(state["game_id"])
     return jsonify(_public_state(state, reveal_dealer=True))
 
 
