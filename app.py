@@ -962,6 +962,89 @@ def api_live():
     return jsonify(out)
 
 
+# ====== TWITCH: VODs (streams guardadas) ======
+_twitch_uid = {"value": "", "exp": 0}     # cache do user_id do canal (24h)
+_vods_cache = {"data": None, "exp": 0}    # cache dos VODs (~10 min)
+
+
+def _twitch_user_id():
+    """Resolve o login do canal para user_id (necessario para helix/videos)."""
+    now = time.time()
+    if _twitch_uid["value"] and _twitch_uid["exp"] > now:
+        return _twitch_uid["value"]
+    token = _twitch_app_token()
+    url = "https://api.twitch.tv/helix/users?login=" + _uparse.quote(TWITCH_CHANNEL)
+    headers = {"Client-Id": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"}
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode())
+    items = data.get("data") or []
+    uid = items[0]["id"] if items else ""
+    if uid:
+        _twitch_uid["value"] = uid
+        _twitch_uid["exp"] = now + 86400
+    return uid
+
+
+def _fmt_twitch_duration(dur):
+    """Twitch '16h23m12s' -> '16h 23m' (ou '23m', '45s')."""
+    import re as _re
+    h = _re.search(r"(\d+)h", dur)
+    m = _re.search(r"(\d+)m", dur)
+    sec = _re.search(r"(\d+)s", dur)
+    h = int(h.group(1)) if h else 0
+    m = int(m.group(1)) if m else 0
+    sec = int(sec.group(1)) if sec else 0
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    if m > 0:
+        return f"{m}m"
+    return f"{sec}s"
+
+
+@app.route("/api/vods")
+def api_vods():
+    """Ultimos VODs (streams guardadas) do canal na Twitch. Cacheado ~10 min.
+    Sem credenciais -> configured=False (o frontend esconde a seccao)."""
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        return jsonify({"configured": False, "vods": []})
+    now = time.time()
+    if _vods_cache["data"] is not None and _vods_cache["exp"] > now:
+        return jsonify(_vods_cache["data"])
+    try:
+        uid = _twitch_user_id()
+        if not uid:
+            out = {"configured": True, "channel": TWITCH_CHANNEL, "vods": []}
+            _vods_cache["data"] = out; _vods_cache["exp"] = now + 120
+            return jsonify(out)
+        token = _twitch_app_token()
+        url = ("https://api.twitch.tv/helix/videos?user_id=" + uid
+               + "&type=archive&sort=time&first=12")
+        headers = {"Client-Id": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        vods = []
+        for v in (data.get("data") or []):
+            thumb = (v.get("thumbnail_url") or "")
+            thumb = thumb.replace("%{width}", "480").replace("%{height}", "270")
+            vods.append({
+                "id": v.get("id", ""),
+                "title": v.get("title", ""),
+                "url": v.get("url", ""),
+                "thumbnail": thumb,
+                "duration": _fmt_twitch_duration(v.get("duration", "")),
+                "created_at": v.get("created_at", ""),
+                "views": v.get("view_count", 0),
+            })
+        out = {"configured": True, "channel": TWITCH_CHANNEL, "vods": vods}
+    except Exception:
+        out = {"configured": True, "channel": TWITCH_CHANNEL, "vods": [], "error": True}
+    _vods_cache["data"] = out
+    _vods_cache["exp"] = now + 600
+    return jsonify(out)
+
+
 # =====================================================================
 #  MINES · PLINKO · CRASH — jogos extra (pontos do canal, só diversão)
 #  Resultado decidido SEMPRE no servidor. Apostas/pagamentos em pontos SE.
