@@ -1160,13 +1160,13 @@ def mines_cashout():
     })
 
 # =====================  PLINKO  =====================
-PLINKO_ROWS = 12
-# 13 slots (simétrico). Três níveis de risco — quanto maior o risco, mais pagam as pontas
-# e menos paga o centro (mais variância). EV ~0.96-0.99 em todos (pesos binomiais).
+PLINKO_ROWS = 16
+# 17 casas (16 linhas, simétrico). Três níveis de risco (tabelas Stake): mais risco =
+# pontas pagam muito mais e centro paga menos (mais variância). Todas ~99% RTP.
 PLINKO_TABLES = {
-    "low":    [10, 3, 1.6, 1.4, 1.1, 1, 0.5, 1, 1.1, 1.4, 1.6, 3, 10],
-    "medium": [26, 6, 2.4, 1.4, 1, 0.8, 0.7, 0.8, 1, 1.4, 2.4, 6, 26],
-    "high":   [170, 24, 8.1, 2, 0.7, 0.2, 0.2, 0.2, 0.7, 2, 8.1, 24, 170],
+    "low":    [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1, 0.5, 1, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
+    "medium": [110, 41, 10, 5, 3, 1.5, 1, 0.5, 0.3, 0.5, 1, 1.5, 3, 5, 10, 41, 110],
+    "high":   [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000],
 }
 PLINKO_MULTS = PLINKO_TABLES["medium"]  # default
 
@@ -1296,14 +1296,27 @@ def crash_cashout():
         return jsonify({"error": "não autenticado"}), 401
     data = request.get_json(silent=True) or {}
     gid = data.get("id") or ""
+    try:
+        client_mult = float(data.get("mult", 0) or 0)
+    except (TypeError, ValueError):
+        client_mult = 0.0
     state = _gstore_get(CRASH_STORE, gid)
     if not state or state.get("user") != username:
         return jsonify({"error": "jogo não encontrado"}), 404
     elapsed = time.time() - state["start"]
-    cur = crash_mult_at(elapsed)
+    server_mult = crash_mult_at(elapsed)
+    # Usa o multiplicador que o jogador via no instante do clique (enviado pelo cliente),
+    # mas nunca acima do que o servidor já mostra — impede reclamar valores futuros e,
+    # ao mesmo tempo, deixa de penalizar a latência de quem carregou a tempo.
+    use_mult = server_mult
+    if client_mult > 0:
+        use_mult = min(client_mult, server_mult)
+    if use_mult < 1.0:
+        use_mult = 1.0
+    use_mult = round(use_mult, 2)
     _gstore_delete(CRASH_STORE, gid)
-    if cur >= state["crash"]:
-        # tarde demais — já tinha rebentado
+    if use_mult >= state["crash"]:
+        # mesmo no instante do clique já tinha rebentado — perdeu
         try:
             real_balance = get_user_points(username)
         except Exception:
@@ -1311,13 +1324,13 @@ def crash_cashout():
         return jsonify({"cashed": False, "crashed": True,
                         "crash_point": state["crash"], "delta": -state["bet"],
                         "balance": real_balance})
-    payout = round(state["bet"] * cur)
+    payout = round(state["bet"] * use_mult)
     try:
         add_user_points(username, payout)
         real_balance = state["balance"] + payout
     except Exception:
         return jsonify({"error": "falha a atualizar os pontos"}), 502
-    return jsonify({"cashed": True, "multiplier": cur, "payout": payout,
+    return jsonify({"cashed": True, "multiplier": use_mult, "payout": payout,
                     "delta": payout - state["bet"], "balance": real_balance,
                     "crash_point": state["crash"]})
 
