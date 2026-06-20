@@ -961,6 +961,357 @@ def api_live():
     return jsonify(out)
 
 
+# =====================================================================
+#  MINES · PLINKO · CRASH — jogos extra (pontos do canal, só diversão)
+#  Resultado decidido SEMPRE no servidor. Apostas/pagamentos em pontos SE.
+# =====================================================================
+import math as _math
+
+# ---- store genérico em disco (mesmo padrão do blackjack: atómico + lock + TTL) ----
+_games_lock = threading.Lock()
+GAME_TTL = 1800  # 30 min
+
+def _gstore_load(path):
+    try:
+        with open(path, "r") as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def _gstore_save(path, games):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            _json.dump(games, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[gstore] erro a gravar: {e}")
+
+def _gstore_get(path, gid):
+    if not gid:
+        return None
+    return _gstore_load(path).get(gid)
+
+def _gstore_put(path, state):
+    with _games_lock:
+        games = _gstore_load(path)
+        now = time.time()
+        for k in list(games.keys()):  # limpa jogos abandonados
+            if now - games[k].get("ts", now) > GAME_TTL:
+                games.pop(k, None)
+        games[state["id"]] = state
+        _gstore_save(path, games)
+
+def _gstore_delete(path, gid):
+    with _games_lock:
+        games = _gstore_load(path)
+        if games.pop(gid, None) is not None:
+            _gstore_save(path, games)
+
+def _read_bet(data):
+    try:
+        return int(data.get("bet", 0))
+    except (TypeError, ValueError):
+        return None
+
+# =====================  MINES  =====================
+MINES_STORE = os.environ.get("MINES_STORE_PATH", "/tmp/mines_games.json")
+MINES_TILES = 25  # grelha 5x5
+
+def mines_multiplier(safe, mines):
+    """Multiplicador justo após 'safe' casas seguras viradas, com 'mines' minas."""
+    m = 1.0
+    for i in range(safe):
+        m *= (MINES_TILES - i) / (MINES_TILES - mines - i)
+    return round(m, 2)
+
+@app.route("/api/play/mines/start", methods=["POST"])
+def mines_start():
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    bet = _read_bet(data)
+    if bet is None:
+        return jsonify({"error": "aposta inválida"}), 400
+    try:
+        mines = int(data.get("mines", 3))
+    except (TypeError, ValueError):
+        return jsonify({"error": "número de minas inválido"}), 400
+    if mines < 1 or mines > MINES_TILES - 1:
+        return jsonify({"error": f"minas têm de ser entre 1 e {MINES_TILES-1}"}), 400
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({"error": f"aposta tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if bet > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+    # tira a aposta já (fica comprometida nesta ronda)
+    try:
+        add_user_points(username, -bet)
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+    # sorteia as minas (posições 0..24)
+    positions = list(range(MINES_TILES))
+    for i in range(len(positions) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        positions[i], positions[j] = positions[j], positions[i]
+    mine_set = positions[:mines]
+    gid = uuid.uuid4().hex
+    state = {
+        "id": gid, "user": username, "bet": bet, "mines": mines,
+        "mine_set": mine_set, "revealed": [], "balance": balance - bet,
+        "ts": time.time(),
+    }
+    _gstore_put(MINES_STORE, state)
+    return jsonify({
+        "id": gid, "tiles": MINES_TILES, "mines": mines, "bet": bet,
+        "multiplier": 1.0, "next_multiplier": mines_multiplier(1, mines),
+        "balance": balance - bet,
+    })
+
+@app.route("/api/play/mines/reveal", methods=["POST"])
+def mines_reveal():
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    gid = data.get("id") or ""
+    state = _gstore_get(MINES_STORE, gid)
+    if not state or state.get("user") != username:
+        return jsonify({"error": "jogo não encontrado"}), 404
+    try:
+        tile = int(data.get("tile", -1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "casa inválida"}), 400
+    if tile < 0 or tile >= MINES_TILES:
+        return jsonify({"error": "casa inválida"}), 400
+    if tile in state["revealed"]:
+        return jsonify({"error": "casa já virada"}), 400
+
+    if tile in state["mine_set"]:
+        # BUM — perdeu (a aposta já saiu no start)
+        _gstore_delete(MINES_STORE, gid)
+        try:
+            real_balance = get_user_points(username)
+        except Exception:
+            real_balance = state["balance"]
+        return jsonify({
+            "bust": True, "tile": tile, "mine_set": state["mine_set"],
+            "multiplier": 0, "delta": -state["bet"], "balance": real_balance,
+        })
+
+    state["revealed"].append(tile)
+    state["ts"] = time.time()
+    safe = len(state["revealed"])
+    mult = mines_multiplier(safe, state["mines"])
+    remaining_safe = MINES_TILES - state["mines"] - safe
+    if remaining_safe <= 0:
+        # virou todas as seguras -> cashout automático
+        payout = round(state["bet"] * mult)
+        _gstore_delete(MINES_STORE, gid)
+        try:
+            add_user_points(username, payout)
+            real_balance = state["balance"] + payout
+        except Exception:
+            return jsonify({"error": "falha a atualizar os pontos"}), 502
+        return jsonify({
+            "safe": True, "tile": tile, "multiplier": mult, "cleared": True,
+            "cashed": True, "payout": payout, "delta": payout - state["bet"],
+            "balance": real_balance,
+        })
+    _gstore_put(MINES_STORE, state)
+    return jsonify({
+        "safe": True, "tile": tile, "multiplier": mult,
+        "next_multiplier": mines_multiplier(safe + 1, state["mines"]),
+        "cashout_value": round(state["bet"] * mult), "safe_count": safe,
+    })
+
+@app.route("/api/play/mines/cashout", methods=["POST"])
+def mines_cashout():
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    gid = data.get("id") or ""
+    state = _gstore_get(MINES_STORE, gid)
+    if not state or state.get("user") != username:
+        return jsonify({"error": "jogo não encontrado"}), 404
+    safe = len(state["revealed"])
+    if safe < 1:
+        return jsonify({"error": "vira pelo menos uma casa primeiro"}), 400
+    mult = mines_multiplier(safe, state["mines"])
+    payout = round(state["bet"] * mult)
+    _gstore_delete(MINES_STORE, gid)
+    try:
+        add_user_points(username, payout)
+        real_balance = state["balance"] + payout
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+    return jsonify({
+        "cashed": True, "multiplier": mult, "payout": payout,
+        "delta": payout - state["bet"], "balance": real_balance,
+        "mine_set": state["mine_set"],
+    })
+
+# =====================  PLINKO  =====================
+PLINKO_ROWS = 12
+# 13 slots (simétrico). EV ~0.93 com pesos binomiais — divertido, ligeira margem.
+PLINKO_MULTS = [14, 4, 2, 1.4, 1.1, 0.8, 0.5, 0.8, 1.1, 1.4, 2, 4, 14]
+
+@app.route("/api/play/plinko", methods=["POST"])
+def play_plinko():
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    bet = _read_bet(data)
+    if bet is None:
+        return jsonify({"error": "aposta inválida"}), 400
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({"error": f"aposta tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if bet > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+    # cai pela tábua: cada linha vai esquerda(0) ou direita(1)
+    path = [secrets.randbelow(2) for _ in range(PLINKO_ROWS)]
+    slot = sum(path)
+    mult = PLINKO_MULTS[slot]
+    payout = round(bet * mult)
+    delta = payout - bet
+    try:
+        add_user_points(username, delta)
+        new_balance = balance + delta
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+    return jsonify({
+        "path": path, "slot": slot, "mult": mult,
+        "won": delta > 0, "delta": delta, "payout": payout,
+        "balance": new_balance, "rows": PLINKO_ROWS, "mults": PLINKO_MULTS,
+    })
+
+# =====================  CRASH  =====================
+CRASH_STORE = os.environ.get("CRASH_STORE_PATH", "/tmp/crash_games.json")
+CRASH_K = 0.13     # ritmo de subida do multiplicador (por segundo)
+CRASH_MAX = 100.0  # teto
+
+def crash_mult_at(elapsed):
+    """Multiplicador no instante 'elapsed' (segundos desde o arranque)."""
+    if elapsed <= 0:
+        return 1.00
+    m = _math.exp(CRASH_K * elapsed)
+    if m > CRASH_MAX:
+        m = CRASH_MAX
+    return round(m, 2)
+
+def _roll_crash_point():
+    """Ponto de rebentamento. Cauda pesada (P(>=x)~1/x) + 1% de bust instantâneo."""
+    r = secrets.randbelow(1_000_000) / 1_000_000.0
+    if r < 0.01:
+        return 1.00
+    cp = 0.99 / (1.0 - r)
+    if cp > CRASH_MAX:
+        cp = CRASH_MAX
+    return round(cp, 2)
+
+@app.route("/api/play/crash/start", methods=["POST"])
+def crash_start():
+    if not SE_JWT or not CHANNEL_ID:
+        return jsonify({"error": "backend não configurado"}), 500
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    bet = _read_bet(data)
+    if bet is None:
+        return jsonify({"error": "aposta inválida"}), 400
+    if bet < MIN_BET or bet > MAX_BET:
+        return jsonify({"error": f"aposta tem de ser entre {MIN_BET} e {MAX_BET}"}), 400
+    try:
+        balance = get_user_points(username)
+    except Exception:
+        return jsonify({"error": "falha a ler o saldo"}), 502
+    if bet > balance:
+        return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+    try:
+        add_user_points(username, -bet)
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+    gid = uuid.uuid4().hex
+    now = time.time()
+    state = {
+        "id": gid, "user": username, "bet": bet, "crash": _roll_crash_point(),
+        "start": now, "balance": balance - bet, "ts": now,
+    }
+    _gstore_put(CRASH_STORE, state)
+    return jsonify({"id": gid, "bet": bet, "balance": balance - bet, "k": CRASH_K})
+
+@app.route("/api/play/crash/state", methods=["POST"])
+def crash_state():
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    gid = data.get("id") or ""
+    state = _gstore_get(CRASH_STORE, gid)
+    if not state or state.get("user") != username:
+        return jsonify({"error": "jogo não encontrado"}), 404
+    elapsed = time.time() - state["start"]
+    cur = crash_mult_at(elapsed)
+    if cur >= state["crash"]:
+        _gstore_delete(CRASH_STORE, gid)
+        try:
+            real_balance = get_user_points(username)
+        except Exception:
+            real_balance = state["balance"]
+        return jsonify({"running": False, "crashed": True,
+                        "crash_point": state["crash"], "balance": real_balance,
+                        "delta": -state["bet"]})
+    return jsonify({"running": True, "multiplier": cur, "crashed": False})
+
+@app.route("/api/play/crash/cashout", methods=["POST"])
+def crash_cashout():
+    username = verify_user(request)
+    if not username:
+        return jsonify({"error": "não autenticado"}), 401
+    data = request.get_json(silent=True) or {}
+    gid = data.get("id") or ""
+    state = _gstore_get(CRASH_STORE, gid)
+    if not state or state.get("user") != username:
+        return jsonify({"error": "jogo não encontrado"}), 404
+    elapsed = time.time() - state["start"]
+    cur = crash_mult_at(elapsed)
+    _gstore_delete(CRASH_STORE, gid)
+    if cur >= state["crash"]:
+        # tarde demais — já tinha rebentado
+        try:
+            real_balance = get_user_points(username)
+        except Exception:
+            real_balance = state["balance"]
+        return jsonify({"cashed": False, "crashed": True,
+                        "crash_point": state["crash"], "delta": -state["bet"],
+                        "balance": real_balance})
+    payout = round(state["bet"] * cur)
+    try:
+        add_user_points(username, payout)
+        real_balance = state["balance"] + payout
+    except Exception:
+        return jsonify({"error": "falha a atualizar os pontos"}), 502
+    return jsonify({"cashed": True, "multiplier": cur, "payout": payout,
+                    "delta": payout - state["bet"], "balance": real_balance,
+                    "crash_point": state["crash"]})
+
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8090))
     app.run(host="0.0.0.0", port=port)
