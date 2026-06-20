@@ -448,6 +448,7 @@ def play_roulette_multi():
         "number": number,
         "color": ("green" if number == 0 else ("red" if number in RED_NUMBERS else "black")),
         "delta": delta,
+        "gross": gross_return,
         "balance": new_balance
     })
 
@@ -1160,8 +1161,14 @@ def mines_cashout():
 
 # =====================  PLINKO  =====================
 PLINKO_ROWS = 12
-# 13 slots (simétrico). EV ~0.93 com pesos binomiais — divertido, ligeira margem.
-PLINKO_MULTS = [14, 4, 2, 1.4, 1.1, 0.8, 0.5, 0.8, 1.1, 1.4, 2, 4, 14]
+# 13 slots (simétrico). Três níveis de risco — quanto maior o risco, mais pagam as pontas
+# e menos paga o centro (mais variância). EV ~0.96-0.99 em todos (pesos binomiais).
+PLINKO_TABLES = {
+    "low":    [10, 3, 1.6, 1.4, 1.1, 1, 0.5, 1, 1.1, 1.4, 1.6, 3, 10],
+    "medium": [26, 6, 2.4, 1.4, 1, 0.8, 0.7, 0.8, 1, 1.4, 2.4, 6, 26],
+    "high":   [170, 24, 8.1, 2, 0.7, 0.2, 0.2, 0.2, 0.7, 2, 8.1, 24, 170],
+}
+PLINKO_MULTS = PLINKO_TABLES["medium"]  # default
 
 @app.route("/api/play/plinko", methods=["POST"])
 def play_plinko():
@@ -1182,10 +1189,14 @@ def play_plinko():
         return jsonify({"error": "falha a ler o saldo"}), 502
     if bet > balance:
         return jsonify({"error": "não tens pontos suficientes", "balance": balance}), 400
+    risk = (data.get("risk") or "medium").lower()
+    if risk not in PLINKO_TABLES:
+        risk = "medium"
+    table = PLINKO_TABLES[risk]
     # cai pela tábua: cada linha vai esquerda(0) ou direita(1)
     path = [secrets.randbelow(2) for _ in range(PLINKO_ROWS)]
     slot = sum(path)
-    mult = PLINKO_MULTS[slot]
+    mult = table[slot]
     payout = round(bet * mult)
     delta = payout - bet
     try:
@@ -1194,9 +1205,9 @@ def play_plinko():
     except Exception:
         return jsonify({"error": "falha a atualizar os pontos"}), 502
     return jsonify({
-        "path": path, "slot": slot, "mult": mult,
+        "path": path, "slot": slot, "mult": mult, "risk": risk,
         "won": delta > 0, "delta": delta, "payout": payout,
-        "balance": new_balance, "rows": PLINKO_ROWS, "mults": PLINKO_MULTS,
+        "balance": new_balance, "rows": PLINKO_ROWS, "mults": table,
     })
 
 # =====================  CRASH  =====================
